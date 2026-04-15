@@ -59,7 +59,13 @@ jobs:
           BASE_NAME=$(echo "$FULL_FILENAME" | sed -E 's/\.(tgz|tar\.gz)$//')
           echo "ORIGINAL_FILENAME=$BASE_NAME" >> $GITHUB_ENV
           
-          aria2c -x 16 -s 16 -o rom_archive.tgz "${{ github.event.inputs.rom_url }}"
+          wget -c \
+               --tries=0 \
+               --read-timeout=20 \
+               --waitretry=1 \
+               --no-check-certificate \
+               --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36" \
+               -O rom_archive.tgz "${{ github.event.inputs.rom_url }}"
 
       - name: 📦 Extract ROM
         run: |
