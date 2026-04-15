@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: "Direct ROM .tgz / .tar.gz link"
+        description: "Direct ROM link"
         required: true
 
 jobs:
@@ -32,32 +32,28 @@ jobs:
             sudo rm -rf /var/lib/apt/lists/*
           } 2>&1 | tee -a build.log
 
-      - name: 🛠️ Setup Android Tools (Official Google + Ravindu644 Static)
+      - name: 🛠️ Setup Android Tools
         run: |
           set -euo pipefail
           {
             mkdir -p bin
-            
-            # 1. Official Google SDK (for e2fsdroid/mke2fs)
             wget https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O pt.zip
             unzip -q pt.zip
-            mv platform-tools/e2fsdroid bin/
-            mv platform-tools/mke2fs bin/
             
-            # 2. Ravindu644 Static Binaries (for lpmake/lpunpack)
-            # Using raw links to ensurewget pulls the binary correctly
+            FIND_E2=$(find . -name e2fsdroid -type f | head -n1)
+            FIND_MK=$(find . -name mke2fs -type f | head -n1)
+            [ -n "$FIND_E2" ] && cp "$FIND_E2" bin/e2fsdroid
+            [ -n "$FIND_MK" ] && cp "$FIND_MK" bin/mke2fs
+            
             wget https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpmake -O bin/lpmake
             wget https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O bin/lpunpack
             
-            # 3. Cleanup and Permissions
             rm -rf platform-tools pt.zip
             chmod +x bin/*
             sudo mv bin/* /usr/local/bin/
             
-            # Verification
-            echo "✅ Tools Setup Complete"
-            lpunpack --version || echo "lpunpack loaded"
-            e2fsdroid -V || true
+            command -v e2fsdroid >/dev/null || exit 1
+            command -v lpunpack >/dev/null || exit 1
           } 2>&1 | tee -a build.log
 
       - name: 📥 Download ROM
@@ -91,7 +87,7 @@ jobs:
             echo "SUPER_RAW_SIZE=$(stat -c%s super_raw.img)" >> $GITHUB_ENV
           } 2>&1 | tee -a build.log
 
-      - name: 📤 Throttled Extraction (Diamond-Secure)
+      - name: 📤 Throttled Extraction
         run: |
           set -euo pipefail
           {
@@ -113,11 +109,8 @@ jobs:
                 IMG="super_extracted/${part}_a.img"
                 [ -f "$IMG" ] || IMG="super_extracted/${part}.img"
                 mkdir -p "$part" "mnt_$part"
-                
-                # Loop attachment for kernel-level FS check
                 LOOP=$(sudo losetup -f --show "$IMG")
                 sudo blkid "$LOOP" | grep -q 'TYPE="erofs"' && FT="erofs" || FT="ext4"
-                
                 sudo mount -t $FT "$LOOP" "mnt_$part" || exit 1
                 sudo cp -a "mnt_$part"/. "$part"/
                 sudo umount -l "mnt_$part"
@@ -142,7 +135,7 @@ jobs:
             fi
           } 2>&1 | tee -a build.log
 
-      - name: 📏 Smart Adaptive Sizing
+      - name: 📏 Calculate Sizes
         run: |
           set -euo pipefail
           {
@@ -171,7 +164,7 @@ jobs:
             echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
           } 2>&1 | tee -a build.log
 
-      - name: 🧱 Build Filesystems (Parallel)
+      - name: 🧱 Build Filesystems
         run: |
           set -euo pipefail
           {
@@ -225,11 +218,6 @@ jobs:
             tar -I 'pigz -9' -cvf "$FINAL_NAME" "${{ env.ROM_DIR }}"
             sha256sum "$FINAL_NAME" > "${FINAL_NAME}.sha256"
           } 2>&1 | tee -a build.log
-
-      - name: 📊 Summary
-        run: |
-          echo "### ✅ Build Success" >> $GITHUB_STEP_SUMMARY
-          echo "- **Super Partition Size:** ${{ env.SUPER_FINAL }} bytes" >> $GITHUB_STEP_SUMMARY
 
       - name: 📤 Upload
         uses: actions/upload-artifact@v4
