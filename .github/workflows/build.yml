@@ -41,16 +41,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p bin
-          # Pulling from a reliable community mirror of LonelyFool's tools
-          wget https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/main/binary/lpunpack -O bin/lpunpack
-          wget https://github.com/whyshhnuv/lpunpack-lpmake-mirror/raw/main/binary/lpmake -O bin/lpmake
+          # Stable mirror for Android super partition tools
+          wget https://github.com/Yumi-Sora/Mi-Flash-Tool-Binaries/raw/main/lpunpack -O bin/lpunpack || \
+          wget https://github.com/AnandSaha/Android_lptools/raw/master/bin/lpunpack -O bin/lpunpack
+          
+          wget https://github.com/Yumi-Sora/Mi-Flash-Tool-Binaries/raw/main/lpmake -O bin/lpmake || \
+          wget https://github.com/AnandSaha/Android_lptools/raw/master/bin/lpmake -O bin/lpmake
           
           chmod +x bin/*
           sudo mv bin/* /usr/local/bin/
-          
-          # Verification
-          command -v lpunpack || { echo "ERROR: lpunpack setup failed"; exit 1; }
-          command -v lpmake || { echo "ERROR: lpmake setup failed"; exit 1; }
+          command -v lpunpack || exit 1
+          command -v lpmake || exit 1
 
       - name: 📥 Download ROM
         run: |
@@ -64,10 +65,8 @@ jobs:
       - name: 📦 Extract ROM
         run: |
           set -euo pipefail
-          # Try gzip engine first, fallback to auto-detect
           tar -xvzf rom_archive.tgz || tar -xvf rom_archive.tgz
           
-          # Universal deep-search for images folder (works for any Xiaomi device)
           ROM_DIR=$(find . -type d -name "images" | head -n1 | sed 's|/images||')
           if [ -z "$ROM_DIR" ]; then echo "ERROR: images folder not found!"; exit 1; fi
           echo "ROM_DIR=$ROM_DIR" >> $GITHUB_ENV
@@ -102,7 +101,7 @@ jobs:
           command -v fsck.erofs >/dev/null || { echo "ERROR: fsck.erofs missing"; exit 1; }
           
           if file super_extracted/system_a.img | grep -qiE "erofs|compressed"; then
-            echo "EROFS/Compressed detected - Extracting..."
+            echo "EROFS detected - Extracting..."
             sudo fsck.erofs --extract=system super_extracted/system_a.img
             sudo fsck.erofs --extract=product super_extracted/product_a.img
             sudo fsck.erofs --extract=system_ext super_extracted/system_ext_a.img
@@ -124,7 +123,6 @@ jobs:
           set -euo pipefail
           chmod +x debloat.sh
           cd "$ROM_DIR/images"
-          # Run with sudo to modify files extracted with root permissions
           sudo bash ../../debloat.sh
 
       - name: 📏 Calculate Sizes
@@ -135,7 +133,6 @@ jobs:
           PROD=$(sudo du -sm product | cut -f1)
           EXT=$(sudo du -sm system_ext | cut -f1)
           
-          # 150MB Buffer for metadata and partition overhead
           SYS=$((SYS + 150)); PROD=$((PROD + 150)); EXT=$((EXT + 150))
           
           SYS_BYTES=$((SYS * 1024 * 1024))
@@ -144,7 +141,7 @@ jobs:
 
           TOTAL=$((SYS_BYTES + PROD_BYTES + EXT_BYTES))
           if [ $TOTAL -gt $SUPER_SIZE ]; then
-            echo "ERROR: Total partition size ($TOTAL) exceeds super capacity ($SUPER_SIZE)!"
+            echo "ERROR: Partition size exceeds super capacity!"
             exit 1
           fi
 
@@ -160,7 +157,6 @@ jobs:
           set -euo pipefail
           cd "$ROM_DIR/images"
           if [ "${{ github.event.inputs.fs_type }}" = "ext4" ]; then
-            echo "Building EXT4 Sparse..."
             sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d system system_raw.img ${SYS_MB}M
             sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d product product_raw.img ${PROD_MB}M
             sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d system_ext system_ext_raw.img ${EXT_MB}M
@@ -168,7 +164,6 @@ jobs:
             img2simg product_raw.img product_new.img
             img2simg system_ext_raw.img system_ext_new.img
           else
-            echo "Building EROFS..."
             sudo mkfs.erofs -zlz4hc system_new.img system
             sudo mkfs.erofs -zlz4hc product_new.img product
             sudo mkfs.erofs -zlz4hc system_ext_new.img system_ext
@@ -179,9 +174,9 @@ jobs:
           set -euo pipefail
           cd "$ROM_DIR/images"
           
-          [ -f system_new.img ] || { echo "ERROR: system_new.img missing"; exit 1; }
-          [ -f product_new.img ] || { echo "ERROR: product_new.img missing"; exit 1; }
-          [ -f system_ext_new.img ] || { echo "ERROR: system_ext_new.img missing"; exit 1; }
+          [ -f system_new.img ] || exit 1
+          [ -f product_new.img ] || exit 1
+          [ -f system_ext_new.img ] || exit 1
 
           LP_ARGS="--metadata-size 65536 --metadata-slots 2 --super-name super --device super:${SUPER_SIZE} --group main:${SUPER_SIZE} --sparse"
           
@@ -195,7 +190,6 @@ jobs:
             --output super_final.img
           
           mv super_final.img super.img
-          echo "✅ Final super.img created: $(ls -lh super.img | awk '{print $5}')"
 
       - name: 📦 Clean, Pack & Checksum
         run: |
@@ -211,28 +205,19 @@ jobs:
           FINAL_NAME="Debloated_${{ env.ORIGINAL_FILENAME }}_${DATE_STAMP}.tgz"
           echo "FINAL_NAME=$FINAL_NAME" >> $GITHUB_ENV
           
-          # Pack using parallel compression
           tar -I pigz -cvf "$FINAL_NAME" "$ROM_DIR"
           sha256sum "$FINAL_NAME" > "${FINAL_NAME}.sha256"
           
-          # Accurately calculate duration using fallback for safety
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - ${BUILD_START:-END_TIME}))
           echo "BUILD_TIME=$DURATION" >> $GITHUB_ENV
-          
-          # Final sanity checks
-          stat -c "%n %s bytes" "$FINAL_NAME"
-          sha256sum -c "${FINAL_NAME}.sha256"
-          ls -lh "$FINAL_NAME"*
 
       - name: 📊 Build Summary
         run: |
           set -euo pipefail
           echo "✅ Build complete: ${{ env.FINAL_NAME }}"
-          echo "⏱ Build Duration: ${{ env.BUILD_TIME }} seconds"
-          echo "📏 Final Package Size: $(du -sh ${{ env.FINAL_NAME }} | cut -f1)"
-          echo "📏 Super Size (Uncompressed): $(ls -lh "${{ env.ROM_DIR }}/images/super.img" | awk '{print $5}')"
-          echo "📏 Partition Sizes: Sys: ${{ env.SYS_MB }}MB | Prod: ${{ env.PROD_MB }}MB | Ext: ${{ env.EXT_MB }}MB"
+          echo "⏱ Duration: ${{ env.BUILD_TIME }}s"
+          echo "📏 Super Size: $(ls -lh "${{ env.ROM_DIR }}/images/super.img" | awk '{print $5}')"
 
       - name: 📤 Upload Artifacts
         uses: actions/upload-artifact@v4
