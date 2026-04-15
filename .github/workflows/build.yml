@@ -19,35 +19,48 @@ jobs:
       - name: ⏱ Start Timer
         run: echo "BUILD_START=$(date +%s)" >> $GITHUB_ENV
 
-      - name: 📥 Dependencies (Hardened)
+      - name: 📥 Dependencies
         run: |
           set -euo pipefail
           {
-            # Suppress interactive prompts in Ubuntu 24.04
             export DEBIAN_FRONTEND=noninteractive
-            
             sudo apt update
+            # Added zlib1g-dev and clang for the tool compilation
             sudo apt install -y wget tar gzip pigz unzip \
               android-sdk-libsparse-utils e2fsprogs lz4 python3 \
-              erofs-utils aria2 file sed coreutils attr util-linux
+              erofs-utils aria2 file sed coreutils attr util-linux \
+              clang zlib1g-dev
             
-            # Reclaim space from apt cache
             sudo apt-get clean
             sudo rm -rf /var/lib/apt/lists/*
-            
-            echo "✅ Dependencies installed successfully."
           } 2>&1 | tee -a build.log
 
-      - name: 🛠️ Setup Android Tools
+      - name: 🛠️ Setup Android Tools (Build from Source)
         run: |
           set -euo pipefail
           {
+            # 1. Setup Static Binaries for lpunpack/lpmake (Safe static sources)
             mkdir -p bin
             wget https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O bin/lpunpack
             wget https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpmake -O bin/lpmake
-            wget https://github.com/carlitox477/e2fsdroid-static/raw/master/e2fsdroid -O bin/e2fsdroid
+            
+            # 2. Build e2fsdroid & mke2fs from the LonelyFool source you provided
+            git clone https://github.com/LonelyFool/e2fsdroid_and_mke2fs.git
+            cd e2fsdroid_and_mke2fs
+            chmod +x make.sh
+            ./make.sh
+            
+            # Move compiled binaries to our bin folder
+            cp bin/e2fsdroid ../bin/
+            cp bin/mke2fs ../bin/
+            cd ..
+
             chmod +x bin/*
             sudo mv bin/* /usr/local/bin/
+            
+            # Verify compilation success
+            command -v e2fsdroid || { echo "❌ e2fsdroid build failed"; exit 1; }
+            command -v lpunpack || { echo "❌ lpunpack setup failed"; exit 1; }
           } 2>&1 | tee -a build.log
 
       - name: 📥 Download ROM
@@ -57,7 +70,6 @@ jobs:
             URL_RAW=$(basename "${{ github.event.inputs.rom_url }}" | cut -d'?' -f1)
             SAFE_NAME=$(echo "$URL_RAW" | sed 's/[^a-zA-Z0-9._-]/-/g' | cut -c1-60)
             echo "ORIGINAL_FILENAME=$SAFE_NAME" >> $GITHUB_ENV
-            
             aria2c -x 16 -s 16 -k 1M --max-tries=5 --timeout=60 --retry-wait=5 --file-allocation=none -o rom_archive.tgz "${{ github.event.inputs.rom_url }}"
           } 2>&1 | tee -a build.log
 
@@ -76,17 +88,13 @@ jobs:
           set -euo pipefail
           {
             cd "${{ env.ROM_DIR }}/images"
-            if file super.img | grep -q "sparse"; then
-              simg2img super.img super_raw.img
-            else
-              cp super.img super_raw.img
-            fi
+            file super.img | grep -q "sparse" && simg2img super.img super_raw.img || cp super.img super_raw.img
             rm -rf super_extracted && mkdir super_extracted
             lpunpack super_raw.img super_extracted/ || exit 1
             echo "SUPER_RAW_SIZE=$(stat -c%s super_raw.img)" >> $GITHUB_ENV
           } 2>&1 | tee -a build.log
 
-      - name: 📤 Extraction (Loop-Secure)
+      - name: 📤 Throttled Extraction (Loop-Secure)
         run: |
           set -euo pipefail
           {
@@ -121,14 +129,12 @@ jobs:
                 sudo cp -a "mnt_$part"/. "$part"/
                 sudo umount -l "mnt_$part"
                 sudo losetup -d "$LOOP"
-                
                 [ "$(ls -A "$part")" ] || { echo "❌ Empty extraction for $part"; exit 1; }
               ) || FAIL=1 &
-              
               while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do sleep 1; done
             done
             wait
-            [ "$FAIL" -eq 0 ] || { echo "❌ A parallel extraction job failed"; exit 1; }
+            [ "$FAIL" -eq 0 ] || exit 1
           } 2>&1 | tee -a build.log
 
       - name: 🧹 Debloat
@@ -139,11 +145,11 @@ jobs:
             if [ -f ../../debloat.sh ]; then
               chmod +x ../../debloat.sh
               bash ../../debloat.sh
-              [ -d "system/app" ] || { echo "❌ Post-debloat integrity failed"; exit 1; }
+              [ -d "system/app" ] || { echo "❌ Post-debloat integrity check failed"; exit 1; }
             fi
           } 2>&1 | tee -a build.log
 
-      - name: 📏 Calculate Sizes
+      - name: 📏 Smart Adaptive Size Logic
         run: |
           set -euo pipefail
           {
@@ -154,7 +160,7 @@ jobs:
               [ -f "$ORIG_IMG" ] || ORIG_IMG="super_extracted/${part}.img"
               
               LOOP=$(sudo losetup -f --show "$ORIG_IMG")
-              if sudo blkid "$LOOP" | grep -q 'TYPE="erofs"'; then FS="erofs"; else FS="ext4"; fi
+              sudo blkid "$LOOP" | grep -q 'TYPE="erofs"' && FS="erofs" || FS="ext4"
               sudo losetup -d "$LOOP"
               
               SIZE_MB=$(sudo du -sm "$part" | cut -f1)
@@ -169,21 +175,15 @@ jobs:
             
             OFFSET=$((64 * 1024 * 1024))
             MAX_SIZE=$((${{ env.SUPER_RAW_SIZE }} - $OFFSET))
-            
             BUFFER=$((TOTAL_BYTES / 10))
             [ "$BUFFER" -lt 268435456 ] && BUFFER=268435456
             FINAL_CALC=$((TOTAL_BYTES + BUFFER))
 
-            if [ "$FINAL_CALC" -gt "$MAX_SIZE" ]; then
-              SUPER_FINAL=$MAX_SIZE
-            else
-              SUPER_FINAL=$FINAL_CALC
-            fi
-            
+            [ "$FINAL_CALC" -gt "$MAX_SIZE" ] && SUPER_FINAL=$MAX_SIZE || SUPER_FINAL=$FINAL_CALC
             echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
           } 2>&1 | tee -a build.log
 
-      - name: 🧱 Build Filesystems
+      - name: 🧱 Build Filesystems (Parallel)
         run: |
           set -euo pipefail
           {
@@ -196,6 +196,7 @@ jobs:
                 SIZE_MB_VAR=${part^^}_MB
                 if [ "${!FS_VAR}" = "ext4" ]; then
                   truncate -s ${!SIZE_MB_VAR}M "${part}_new.img"
+                  # Using the freshly compiled mke2fs and e2fsdroid
                   sudo mke2fs -t ext4 -L "$part" -M "/$part" -O ^has_journal "${part}_new.img"
                   sudo e2fsdroid -e -a "/$part" -f "$part" "${part}_new.img"
                 else
@@ -207,7 +208,7 @@ jobs:
               while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do sleep 1; done
             done
             wait
-            [ "$FAIL" -eq 0 ] || { echo "❌ A parallel build job failed"; exit 1; }
+            [ "$FAIL" -eq 0 ] || exit 1
           } 2>&1 | tee -a build.log
 
       - name: 🧱 Build Super Image
@@ -216,12 +217,10 @@ jobs:
           {
             cd "${{ env.ROM_DIR }}/images"
             LP_ARGS="--metadata-size 65536 --metadata-slots 2 --super-name super --device super:${{ env.SUPER_FINAL }} --group main:${{ env.SUPER_FINAL }} --alignment 4096 --sparse"
-            
             for part in ${{ env.ACTIVE_PARTS }}; do
               BYTES_VAR=${part^^}_BYTES
               LP_ARGS="$LP_ARGS --partition ${part}_a:readonly:${!BYTES_VAR}:main --image ${part}_a=${part}_new.img --partition ${part}_b:readonly:0:main"
             done
-            
             lpmake $LP_ARGS --output super_final.img
             mv super_final.img super.img
           } 2>&1 | tee -a build.log
@@ -233,7 +232,6 @@ jobs:
             cd "${{ env.ROM_DIR }}/images"
             sudo rm -rf super_raw.img super_extracted system product system_ext vendor odm vendor_dlkm system_dlkm *_new.img mnt_* 2>/dev/null || true
             cd ../..
-            
             DATE_STAMP=$(date +%Y%m%d)
             FINAL_NAME="Debloated_${{ env.ORIGINAL_FILENAME }}_${DATE_STAMP}.tgz"
             echo "FINAL_NAME=$FINAL_NAME" >> $GITHUB_ENV
