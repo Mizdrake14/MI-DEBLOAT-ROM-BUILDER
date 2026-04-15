@@ -35,23 +35,26 @@ jobs:
           sudo apt update
           sudo apt install -y wget tar gzip pigz unzip \
             android-sdk-libsparse-utils e2fsprogs lz4 python3 \
-            erofs-utils aria2 file sed coreutils python3-pip
+            erofs-utils aria2 file sed coreutils g++ make libpcre3-dev
 
-      - name: 🛠️ Setup Android Tools (Python lpunpack)
+      - name: 🛠️ Compile Android Tools from Source
         run: |
           set -euo pipefail
-          mkdir -p bin
-          # Download the Python lpunpack you found
-          wget https://raw.githubusercontent.com/unix3dgforce/lpunpack/master/lpunpack.py -O bin/lpunpack.py
+          # Clone the specific repository you provided
+          git clone https://github.com/LonelyFool/lpunpack_and_lpmake.git
+          cd lpunpack_and_lpmake
           
-          # Download lpmake (using a more stable static binary mirror)
-          wget https://github.com/moseat94/lptools-static/raw/main/bin/lpmake -O bin/lpmake
+          # Build the binaries
+          chmod +x make.sh
+          ./make.sh
           
-          chmod +x bin/*
-          sudo mv bin/* /usr/local/bin/
+          # Move binaries to system path
+          sudo cp bin/lpunpack /usr/local/bin/
+          sudo cp bin/lpmake /usr/local/bin/
           
-          # Create a symbolic link for lpunpack to call the python script easily
-          sudo ln -sf /usr/local/bin/lpunpack.py /usr/local/bin/lpunpack
+          # Verification
+          command -v lpunpack || { echo "ERROR: lpunpack build failed"; exit 1; }
+          command -v lpmake || { echo "ERROR: lpmake build failed"; exit 1; }
 
       - name: 📥 Download ROM
         run: |
@@ -67,6 +70,7 @@ jobs:
           set -euo pipefail
           tar -xvzf rom_archive.tgz || tar -xvf rom_archive.tgz
           
+          # Universal deep-search for images folder
           ROM_DIR=$(find . -type d -name "images" | head -n1 | sed 's|/images||')
           if [ -z "$ROM_DIR" ]; then echo "ERROR: images folder not found!"; exit 1; fi
           echo "ROM_DIR=$ROM_DIR" >> $GITHUB_ENV
@@ -74,14 +78,12 @@ jobs:
       - name: 📂 Unpack Super
         run: |
           set -euo pipefail
-          cd "$ROM_DIR/images"
+          cd "${{ env.ROM_DIR }}/images"
           [ -f super.img ] || exit 1
           
           simg2img super.img super_raw.img || cp super.img super_raw.img
-          mkdir super_extracted
-          
-          # Using the Python lpunpack
-          python3 /usr/local/bin/lpunpack.py super_raw.img super_extracted/
+          rm -rf super_extracted && mkdir super_extracted
+          lpunpack super_raw.img super_extracted/
           
           if [ ! -f super_extracted/system_a.img ]; then
             echo "ERROR: lpunpack failed!"
@@ -92,15 +94,17 @@ jobs:
       - name: 📤 Extract Partitions (Hardened Hybrid)
         run: |
           set -euo pipefail
-          cd "$ROM_DIR/images"
+          cd "${{ env.ROM_DIR }}/images"
           sudo rm -rf system product system_ext mnt_sys mnt_prod mnt_ext
           mkdir system product system_ext
           
           if file super_extracted/system_a.img | grep -qiE "erofs|compressed"; then
+            echo "EROFS/Compressed detected - Extracting..."
             sudo fsck.erofs --extract=system super_extracted/system_a.img
             sudo fsck.erofs --extract=product super_extracted/product_a.img
             sudo fsck.erofs --extract=system_ext super_extracted/system_ext_a.img
           else
+            echo "EXT4 detected - Mounting and Copying..."
             sudo mkdir -p mnt_sys mnt_prod mnt_ext
             sudo mount -o loop,ro super_extracted/system_a.img mnt_sys || exit 1
             sudo mount -o loop,ro super_extracted/product_a.img mnt_prod || exit 1
@@ -115,17 +119,18 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x debloat.sh
-          cd "$ROM_DIR/images"
+          cd "${{ env.ROM_DIR }}/images"
           sudo bash ../../debloat.sh
 
       - name: 📏 Calculate Sizes
         run: |
           set -euo pipefail
-          cd "$ROM_DIR/images"
+          cd "${{ env.ROM_DIR }}/images"
           SYS=$(sudo du -sm system | cut -f1)
           PROD=$(sudo du -sm product | cut -f1)
           EXT=$(sudo du -sm system_ext | cut -f1)
           
+          # Add 150MB buffer
           SYS=$((SYS + 150)); PROD=$((PROD + 150)); EXT=$((EXT + 150))
           
           echo "SYS_MB=$SYS" >> $GITHUB_ENV
@@ -138,8 +143,9 @@ jobs:
       - name: 🧱 Build Filesystems
         run: |
           set -euo pipefail
-          cd "$ROM_DIR/images"
+          cd "${{ env.ROM_DIR }}/images"
           if [ "${{ github.event.inputs.fs_type }}" = "ext4" ]; then
+            echo "Building EXT4 Sparse..."
             sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d system system_raw.img ${SYS_MB}M
             sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d product product_raw.img ${PROD_MB}M
             sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d system_ext system_ext_raw.img ${EXT_MB}M
@@ -147,6 +153,7 @@ jobs:
             img2simg product_raw.img product_new.img
             img2simg system_ext_raw.img system_ext_new.img
           else
+            echo "Building EROFS..."
             sudo mkfs.erofs -zlz4hc system_new.img system
             sudo mkfs.erofs -zlz4hc product_new.img product
             sudo mkfs.erofs -zlz4hc system_ext_new.img system_ext
@@ -155,8 +162,12 @@ jobs:
       - name: 🧱 Build Super Image
         run: |
           set -euo pipefail
-          cd "$ROM_DIR/images"
+          cd "${{ env.ROM_DIR }}/images"
           
+          [ -f system_new.img ] || exit 1
+          [ -f product_new.img ] || exit 1
+          [ -f system_ext_new.img ] || exit 1
+
           LP_ARGS="--metadata-size 65536 --metadata-slots 2 --super-name super --device super:${SUPER_SIZE} --group main:${SUPER_SIZE} --sparse"
           
           lpmake $LP_ARGS \
@@ -169,11 +180,12 @@ jobs:
             --output super_final.img
           
           mv super_final.img super.img
+          echo "✅ Final super.img created."
 
       - name: 📦 Clean, Pack & Checksum
         run: |
           set -euo pipefail
-          cd "$ROM_DIR/images"
+          cd "${{ env.ROM_DIR }}/images"
           sudo umount mnt_sys mnt_prod mnt_ext || true
           sudo rm -rf super_raw.img super_extracted system product system_ext *_new.img *_raw.img mnt_*
           cd ../..
@@ -184,19 +196,21 @@ jobs:
           FINAL_NAME="Debloated_${{ env.ORIGINAL_FILENAME }}_${DATE_STAMP}.tgz"
           echo "FINAL_NAME=$FINAL_NAME" >> $GITHUB_ENV
           
-          tar -I pigz -cvf "$FINAL_NAME" "$ROM_DIR"
+          tar -I pigz -cvf "$FINAL_NAME" "${{ env.ROM_DIR }}"
           sha256sum "$FINAL_NAME" > "${FINAL_NAME}.sha256"
           
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - ${BUILD_START:-END_TIME}))
           echo "BUILD_TIME=$DURATION" >> $GITHUB_ENV
+          
+          ls -lh "$FINAL_NAME"*
 
       - name: 📊 Build Summary
         run: |
           set -euo pipefail
           echo "✅ Build complete: ${{ env.FINAL_NAME }}"
           echo "⏱ Build Duration: ${{ env.BUILD_TIME }} seconds"
-          echo "📏 Super Size (Uncompressed): $(ls -lh "${{ env.ROM_DIR }}/images/super.img" | awk '{print $5}')"
+          echo "📏 Super Size: $(ls -lh "${{ env.ROM_DIR }}/images/super.img" | awk '{print $5}')"
 
       - name: 📤 Upload Artifacts
         uses: actions/upload-artifact@v4
