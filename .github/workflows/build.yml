@@ -33,8 +33,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt update
+          # FIX: Removed libsparse-utils (redundant/missing on ubuntu-latest)
           sudo apt install -y wget tar gzip pigz unzip \
-            android-sdk-libsparse-utils libsparse-utils e2fsprogs lz4 python3 \
+            android-sdk-libsparse-utils e2fsprogs lz4 python3 \
             erofs-utils aria2 file sed coreutils
 
       - name: 🛠️ Setup Android Tools
@@ -60,8 +61,10 @@ jobs:
       - name: 📦 Extract ROM
         run: |
           set -euo pipefail
+          # Try gzip engine first, fallback to auto-detect
           tar -xvzf rom_archive.tgz || tar -xvf rom_archive.tgz
           
+          # Universal deep-search for images folder
           ROM_DIR=$(find . -type d -name "images" | head -n1 | sed 's|/images||')
           if [ -z "$ROM_DIR" ]; then echo "ERROR: images folder not found!"; exit 1; fi
           echo "ROM_DIR=$ROM_DIR" >> $GITHUB_ENV
@@ -128,6 +131,7 @@ jobs:
           PROD=$(sudo du -sm product | cut -f1)
           EXT=$(sudo du -sm system_ext | cut -f1)
           
+          # 150MB Buffer for metadata/safety
           SYS=$((SYS + 150)); PROD=$((PROD + 150)); EXT=$((EXT + 150))
           
           SYS_BYTES=$((SYS * 1024 * 1024))
@@ -207,7 +211,7 @@ jobs:
           tar -I pigz -cvf "$FINAL_NAME" "$ROM_DIR"
           sha256sum "$FINAL_NAME" > "${FINAL_NAME}.sha256"
           
-          # FIX: Safe duration calculation using fallback
+          # Accurately calculate duration
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - ${BUILD_START:-END_TIME}))
           echo "BUILD_TIME=$DURATION" >> $GITHUB_ENV
@@ -223,7 +227,6 @@ jobs:
           echo "✅ Build complete: ${{ env.FINAL_NAME }}"
           echo "⏱ Build Duration: ${{ env.BUILD_TIME }} seconds"
           echo "📏 Final Package Size: $(du -sh ${{ env.FINAL_NAME }} | cut -f1)"
-          # FIX: Secure path interpolation for Super size
           echo "📏 Super Size (Uncompressed): $(ls -lh "${{ env.ROM_DIR }}/images/super.img" | awk '{print $5}')"
           echo "📏 Partition Sizes: Sys: ${{ env.SYS_MB }}MB | Prod: ${{ env.PROD_MB }}MB | Ext: ${{ env.EXT_MB }}MB"
 
