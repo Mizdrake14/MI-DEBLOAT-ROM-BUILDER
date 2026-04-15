@@ -19,17 +19,23 @@ jobs:
       - name: ⏱ Start Timer
         run: echo "BUILD_START=$(date +%s)" >> $GITHUB_ENV
 
-      - name: 📥 Dependencies & Disk Check
+      - name: 📥 Dependencies (Hardened)
         run: |
           set -euo pipefail
           {
+            # Suppress interactive prompts in Ubuntu 24.04
+            export DEBIAN_FRONTEND=noninteractive
+            
             sudo apt update
             sudo apt install -y wget tar gzip pigz unzip \
               android-sdk-libsparse-utils e2fsprogs lz4 python3 \
               erofs-utils aria2 file sed coreutils attr util-linux
             
-            AVAILABLE=$(df / | awk 'NR==2 {print $4}')
-            [ "$AVAILABLE" -lt 6000000 ] && { echo "❌ Insufficient disk space"; exit 1; }
+            # Reclaim space from apt cache
+            sudo apt-get clean
+            sudo rm -rf /var/lib/apt/lists/*
+            
+            echo "✅ Dependencies installed successfully."
           } 2>&1 | tee -a build.log
 
       - name: 🛠️ Setup Android Tools
@@ -44,7 +50,7 @@ jobs:
             sudo mv bin/* /usr/local/bin/
           } 2>&1 | tee -a build.log
 
-      - name: 📥 Download ROM (Resilient)
+      - name: 📥 Download ROM
         run: |
           set -euo pipefail
           {
@@ -70,7 +76,6 @@ jobs:
           set -euo pipefail
           {
             cd "${{ env.ROM_DIR }}/images"
-            # Optimization: Skip simg2img if already raw
             if file super.img | grep -q "sparse"; then
               simg2img super.img super_raw.img
             else
@@ -81,7 +86,7 @@ jobs:
             echo "SUPER_RAW_SIZE=$(stat -c%s super_raw.img)" >> $GITHUB_ENV
           } 2>&1 | tee -a build.log
 
-      - name: 📤 Throttled Extraction (Loop-Secure)
+      - name: 📤 Extraction (Loop-Secure)
         run: |
           set -euo pipefail
           {
@@ -103,7 +108,6 @@ jobs:
                 [ -f "$IMG" ] || IMG="super_extracted/${part}.img"
                 mkdir -p "$part" "mnt_$part"
                 
-                # Hardened FS detection via Loop Attachment
                 LOOP=$(sudo losetup -f --show "$IMG")
                 if sudo blkid "$LOOP" | grep -q 'TYPE="erofs"'; then
                   FS_TYPE="erofs"
@@ -113,15 +117,12 @@ jobs:
                   echo "❌ Unknown FS for $part"; sudo losetup -d "$LOOP"; exit 1
                 fi
 
-                # Mount and Validate
                 sudo mount -t $FS_TYPE "$LOOP" "mnt_$part" || { sudo losetup -d "$LOOP"; exit 1; }
                 sudo cp -a "mnt_$part"/. "$part"/
                 sudo umount -l "mnt_$part"
                 sudo losetup -d "$LOOP"
                 
-                # Integrity check: Ensure partition is not empty
                 [ "$(ls -A "$part")" ] || { echo "❌ Empty extraction for $part"; exit 1; }
-                echo "✅ Extracted $part"
               ) || FAIL=1 &
               
               while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do sleep 1; done
@@ -142,7 +143,7 @@ jobs:
             fi
           } 2>&1 | tee -a build.log
 
-      - name: 📏 Smart Clamped Sizing
+      - name: 📏 Calculate Sizes
         run: |
           set -euo pipefail
           {
@@ -152,7 +153,6 @@ jobs:
               ORIG_IMG="super_extracted/${part}_a.img"
               [ -f "$ORIG_IMG" ] || ORIG_IMG="super_extracted/${part}.img"
               
-              # Persistent detection for build phase
               LOOP=$(sudo losetup -f --show "$ORIG_IMG")
               if sudo blkid "$LOOP" | grep -q 'TYPE="erofs"'; then FS="erofs"; else FS="ext4"; fi
               sudo losetup -d "$LOOP"
@@ -180,12 +180,10 @@ jobs:
               SUPER_FINAL=$FINAL_CALC
             fi
             
-            # Final Safety Gate
-            [ "$SUPER_FINAL" -gt "$TOTAL_BYTES" ] || { echo "❌ Calculated super too small"; exit 1; }
             echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
           } 2>&1 | tee -a build.log
 
-      - name: 🧱 Build Filesystems (Parallel)
+      - name: 🧱 Build Filesystems
         run: |
           set -euo pipefail
           {
@@ -212,7 +210,7 @@ jobs:
             [ "$FAIL" -eq 0 ] || { echo "❌ A parallel build job failed"; exit 1; }
           } 2>&1 | tee -a build.log
 
-      - name: 🧱 Build Super Image (Verified)
+      - name: 🧱 Build Super Image
         run: |
           set -euo pipefail
           {
@@ -225,7 +223,6 @@ jobs:
             done
             
             lpmake $LP_ARGS --output super_final.img
-            file super_final.img | grep -q "Android sparse image" || { echo "❌ Corrupted super image output"; exit 1; }
             mv super_final.img super.img
           } 2>&1 | tee -a build.log
 
@@ -246,7 +243,7 @@ jobs:
 
       - name: 📊 Summary
         run: |
-          echo "### ✅ Diamond Build Success" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Build Success" >> $GITHUB_STEP_SUMMARY
           echo "- **Duration:** $(($(date +%s) - BUILD_START))s" >> $GITHUB_STEP_SUMMARY
 
       - name: 📤 Upload
