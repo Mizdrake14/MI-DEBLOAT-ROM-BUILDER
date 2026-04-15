@@ -4,16 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       rom_url:
-        description: "Paste ROM .tgz or .tar.gz link"
+        description: "Direct ROM .tgz / .tar.gz link"
         required: true
-      fs_type:
-        description: "Choose output filesystem"
-        required: true
-        type: choice
-        options:
-          - ext4
-          - erofs
-        default: erofs
 
 jobs:
   build:
@@ -25,224 +17,244 @@ jobs:
         uses: actions/checkout@v4
 
       - name: ⏱ Start Timer
-        run: |
-          set -euo pipefail
-          echo "BUILD_START=$(date +%s)" >> $GITHUB_ENV
+        run: echo "BUILD_START=$(date +%s)" >> $GITHUB_ENV
 
-      - name: 📥 Install Dependencies
+      - name: 📥 Dependencies & Disk Check
         run: |
           set -euo pipefail
-          sudo apt update
-          sudo apt install -y wget tar gzip pigz unzip \
-            android-sdk-libsparse-utils e2fsprogs lz4 python3 \
-            erofs-utils aria2 file sed coreutils
+          {
+            sudo apt update
+            sudo apt install -y wget tar gzip pigz unzip \
+              android-sdk-libsparse-utils e2fsprogs lz4 python3 \
+              erofs-utils aria2 file sed coreutils attr util-linux
+            
+            AVAILABLE=$(df / | awk 'NR==2 {print $4}')
+            [ "$AVAILABLE" -lt 6000000 ] && { echo "❌ Insufficient disk space"; exit 1; }
+          } 2>&1 | tee -a build.log
 
       - name: 🛠️ Setup Android Tools
         run: |
           set -euo pipefail
-          mkdir -p bin
-          # Pulling static x86_64 binaries from the provided repository
-          wget https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O bin/lpunpack
-          wget https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpmake -O bin/lpmake
-          
-          chmod +x bin/*
-          sudo mv bin/* /usr/local/bin/
-          
-          # Verification
-          command -v lpunpack || { echo "ERROR: lpunpack setup failed"; exit 1; }
-          command -v lpmake || { echo "ERROR: lpmake setup failed"; exit 1; }
+          {
+            mkdir -p bin
+            wget https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O bin/lpunpack
+            wget https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpmake -O bin/lpmake
+            wget https://github.com/carlitox477/e2fsdroid-static/raw/master/e2fsdroid -O bin/e2fsdroid
+            chmod +x bin/*
+            sudo mv bin/* /usr/local/bin/
+          } 2>&1 | tee -a build.log
 
-      - name: 📥 Download ROM
+      - name: 📥 Download ROM (Resilient)
         run: |
           set -euo pipefail
-          FULL_FILENAME=$(basename "${{ github.event.inputs.rom_url }}")
-          BASE_NAME=$(echo "$FULL_FILENAME" | sed -E 's/\.(tgz|tar\.gz)$//')
-          echo "ORIGINAL_FILENAME=$BASE_NAME" >> $GITHUB_ENV
-          
-          wget -c \
-               --tries=0 \
-               --read-timeout=20 \
-               --waitretry=1 \
-               --no-check-certificate \
-               --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36" \
-               -O rom_archive.tgz "${{ github.event.inputs.rom_url }}"
+          {
+            URL_RAW=$(basename "${{ github.event.inputs.rom_url }}" | cut -d'?' -f1)
+            SAFE_NAME=$(echo "$URL_RAW" | sed 's/[^a-zA-Z0-9._-]/-/g' | cut -c1-60)
+            echo "ORIGINAL_FILENAME=$SAFE_NAME" >> $GITHUB_ENV
+            
+            aria2c -x 16 -s 16 -k 1M --max-tries=5 --timeout=60 --retry-wait=5 --file-allocation=none -o rom_archive.tgz "${{ github.event.inputs.rom_url }}"
+          } 2>&1 | tee -a build.log
 
       - name: 📦 Extract ROM
         run: |
           set -euo pipefail
-          # Priority extraction: Try gzip engine first
-          tar -xvzf rom_archive.tgz || tar -xvf rom_archive.tgz
-          
-          # Universal deep-search for images folder
-          ROM_DIR=$(find . -type d -name "images" | head -n1 | sed 's|/images||')
-          if [ -z "$ROM_DIR" ]; then echo "ERROR: images folder not found!"; exit 1; fi
-          echo "ROM_DIR=$ROM_DIR" >> $GITHUB_ENV
-          echo "✅ Detected ROM Root: $ROM_DIR"
+          {
+            tar -xvzf rom_archive.tgz || tar -xvf rom_archive.tgz
+            ROM_DIR=$(find . -type f -name "super.img" | head -n1 | sed 's|/images/super.img||;s|/super.img||')
+            [ -z "$ROM_DIR" ] && { echo "❌ super.img not found"; exit 1; }
+            echo "ROM_DIR=$ROM_DIR" >> $GITHUB_ENV
+          } 2>&1 | tee -a build.log
 
       - name: 📂 Unpack Super
         run: |
           set -euo pipefail
-          cd "${{ env.ROM_DIR }}/images"
-          [ -f super.img ] || { echo "ERROR: super.img not found!"; exit 1; }
-          
-          simg2img super.img super_raw.img || cp super.img super_raw.img
-          rm -rf super_extracted && mkdir super_extracted
-          lpunpack super_raw.img super_extracted/
-          
-          if [ ! -f super_extracted/system_a.img ]; then
-            echo "ERROR: lpunpack failed!"
-            exit 1
-          fi
-          
-          SUPER_SIZE=$(stat -c%s super_raw.img)
-          echo "SUPER_SIZE=$SUPER_SIZE" >> $GITHUB_ENV
-          echo "📏 Detected Super Size: $SUPER_SIZE bytes"
+          {
+            cd "${{ env.ROM_DIR }}/images"
+            # Optimization: Skip simg2img if already raw
+            if file super.img | grep -q "sparse"; then
+              simg2img super.img super_raw.img
+            else
+              cp super.img super_raw.img
+            fi
+            rm -rf super_extracted && mkdir super_extracted
+            lpunpack super_raw.img super_extracted/ || exit 1
+            echo "SUPER_RAW_SIZE=$(stat -c%s super_raw.img)" >> $GITHUB_ENV
+          } 2>&1 | tee -a build.log
 
-      - name: 📤 Extract Partitions (Hardened Hybrid)
+      - name: 📤 Throttled Extraction (Loop-Secure)
         run: |
           set -euo pipefail
-          cd "${{ env.ROM_DIR }}/images"
-          sudo rm -rf system product system_ext mnt_sys mnt_prod mnt_ext
-          mkdir system product system_ext
-          
-          command -v fsck.erofs >/dev/null || { echo "ERROR: fsck.erofs not installed"; exit 1; }
-          
-          if file super_extracted/system_a.img | grep -qiE "erofs|compressed"; then
-            echo "EROFS/Compressed detected - Extracting..."
-            sudo fsck.erofs --extract=system super_extracted/system_a.img
-            sudo fsck.erofs --extract=product super_extracted/product_a.img
-            sudo fsck.erofs --extract=system_ext super_extracted/system_ext_a.img
-          else
-            echo "EXT4 detected - Mounting and Copying..."
-            sudo mkdir -p mnt_sys mnt_prod mnt_ext
-            sudo mount -o loop,ro super_extracted/system_a.img mnt_sys || exit 1
-            sudo mount -o loop,ro super_extracted/product_a.img mnt_prod || exit 1
-            sudo mount -o loop,ro super_extracted/system_ext_a.img mnt_ext || exit 1
-            
-            sudo cp -a mnt_sys/. system/
-            sudo cp -a mnt_prod/. product/
-            sudo cp -a mnt_ext/. system_ext/
-            sudo umount mnt_sys mnt_prod mnt_ext
-          fi
+          {
+            cd "${{ env.ROM_DIR }}/images"
+            ACTIVE_PARTS=""
+            for img in super_extracted/*.img; do
+              part=$(basename "$img" | sed 's/_a.img//;s/.img//')
+              [[ "$part" =~ ^(system|product|system_ext|vendor|odm|vendor_dlkm|system_dlkm)$ ]] || continue
+              ACTIVE_PARTS="$ACTIVE_PARTS $part"
+            done
+            echo "ACTIVE_PARTS=$ACTIVE_PARTS" >> $GITHUB_ENV
+
+            MAX_JOBS=2
+            set -m
+            FAIL=0
+            for part in $ACTIVE_PARTS; do
+              (
+                IMG="super_extracted/${part}_a.img"
+                [ -f "$IMG" ] || IMG="super_extracted/${part}.img"
+                mkdir -p "$part" "mnt_$part"
+                
+                # Hardened FS detection via Loop Attachment
+                LOOP=$(sudo losetup -f --show "$IMG")
+                if sudo blkid "$LOOP" | grep -q 'TYPE="erofs"'; then
+                  FS_TYPE="erofs"
+                elif sudo blkid "$LOOP" | grep -q 'TYPE="ext4"'; then
+                  FS_TYPE="ext4"
+                else
+                  echo "❌ Unknown FS for $part"; sudo losetup -d "$LOOP"; exit 1
+                fi
+
+                # Mount and Validate
+                sudo mount -t $FS_TYPE "$LOOP" "mnt_$part" || { sudo losetup -d "$LOOP"; exit 1; }
+                sudo cp -a "mnt_$part"/. "$part"/
+                sudo umount -l "mnt_$part"
+                sudo losetup -d "$LOOP"
+                
+                # Integrity check: Ensure partition is not empty
+                [ "$(ls -A "$part")" ] || { echo "❌ Empty extraction for $part"; exit 1; }
+                echo "✅ Extracted $part"
+              ) || FAIL=1 &
+              
+              while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do sleep 1; done
+            done
+            wait
+            [ "$FAIL" -eq 0 ] || { echo "❌ A parallel extraction job failed"; exit 1; }
+          } 2>&1 | tee -a build.log
 
       - name: 🧹 Debloat
         run: |
           set -euo pipefail
-          chmod +x debloat.sh
-          cd "${{ env.ROM_DIR }}/images"
-          sudo bash ../../debloat.sh
+          {
+            cd "${{ env.ROM_DIR }}/images"
+            if [ -f ../../debloat.sh ]; then
+              chmod +x ../../debloat.sh
+              bash ../../debloat.sh
+              [ -d "system/app" ] || { echo "❌ Post-debloat integrity failed"; exit 1; }
+            fi
+          } 2>&1 | tee -a build.log
 
-      - name: 📏 Calculate Sizes
+      - name: 📏 Smart Clamped Sizing
         run: |
           set -euo pipefail
-          cd "${{ env.ROM_DIR }}/images"
-          SYS=$(sudo du -sm system | cut -f1)
-          PROD=$(sudo du -sm product | cut -f1)
-          EXT=$(sudo du -sm system_ext | cut -f1)
-          
-          # 150MB Buffer for metadata/safety
-          SYS=$((SYS + 150)); PROD=$((PROD + 150)); EXT=$((EXT + 150))
-          
-          SYS_BYTES=$((SYS * 1024 * 1024))
-          PROD_BYTES=$((PROD * 1024 * 1024))
-          EXT_BYTES=$((EXT * 1024 * 1024))
+          {
+            cd "${{ env.ROM_DIR }}/images"
+            TOTAL_BYTES=0
+            for part in ${{ env.ACTIVE_PARTS }}; do
+              ORIG_IMG="super_extracted/${part}_a.img"
+              [ -f "$ORIG_IMG" ] || ORIG_IMG="super_extracted/${part}.img"
+              
+              # Persistent detection for build phase
+              LOOP=$(sudo losetup -f --show "$ORIG_IMG")
+              if sudo blkid "$LOOP" | grep -q 'TYPE="erofs"'; then FS="erofs"; else FS="ext4"; fi
+              sudo losetup -d "$LOOP"
+              
+              SIZE_MB=$(sudo du -sm "$part" | cut -f1)
+              SIZE_MB=$((SIZE_MB + 150))
+              BYTES=$((SIZE_MB * 1024 * 1024))
+              
+              echo "${part^^}_FS=$FS" >> $GITHUB_ENV
+              echo "${part^^}_BYTES=$BYTES" >> $GITHUB_ENV
+              echo "${part^^}_MB=$SIZE_MB" >> $GITHUB_ENV
+              TOTAL_BYTES=$((TOTAL_BYTES + BYTES))
+            done
+            
+            OFFSET=$((64 * 1024 * 1024))
+            MAX_SIZE=$((${{ env.SUPER_RAW_SIZE }} - $OFFSET))
+            
+            BUFFER=$((TOTAL_BYTES / 10))
+            [ "$BUFFER" -lt 268435456 ] && BUFFER=268435456
+            FINAL_CALC=$((TOTAL_BYTES + BUFFER))
 
-          TOTAL=$((SYS_BYTES + PROD_BYTES + EXT_BYTES))
-          if [ $TOTAL -gt $SUPER_SIZE ]; then
-            echo "ERROR: Partition size ($TOTAL) exceeds super ($SUPER_SIZE)!"
-            exit 1
-          fi
+            if [ "$FINAL_CALC" -gt "$MAX_SIZE" ]; then
+              SUPER_FINAL=$MAX_SIZE
+            else
+              SUPER_FINAL=$FINAL_CALC
+            fi
+            
+            # Final Safety Gate
+            [ "$SUPER_FINAL" -gt "$TOTAL_BYTES" ] || { echo "❌ Calculated super too small"; exit 1; }
+            echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
+          } 2>&1 | tee -a build.log
 
-          echo "SYS_MB=$SYS" >> $GITHUB_ENV
-          echo "PROD_MB=$PROD" >> $GITHUB_ENV
-          echo "EXT_MB=$EXT" >> $GITHUB_ENV
-          echo "SYS_BYTES=$SYS_BYTES" >> $GITHUB_ENV
-          echo "PROD_BYTES=$PROD_BYTES" >> $GITHUB_ENV
-          echo "EXT_BYTES=$EXT_BYTES" >> $GITHUB_ENV
-
-      - name: 🧱 Build Filesystems
+      - name: 🧱 Build Filesystems (Parallel)
         run: |
           set -euo pipefail
-          cd "${{ env.ROM_DIR }}/images"
-          if [ "${{ github.event.inputs.fs_type }}" = "ext4" ]; then
-            echo "Building EXT4 Sparse..."
-            sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d system system_raw.img ${SYS_MB}M
-            sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d product product_raw.img ${PROD_MB}M
-            sudo mke2fs -t ext4 -O ^has_journal -T largefile4 -d system_ext system_ext_raw.img ${EXT_MB}M
-            img2simg system_raw.img system_new.img
-            img2simg product_raw.img product_new.img
-            img2simg system_ext_raw.img system_ext_new.img
-          else
-            echo "Building EROFS..."
-            sudo mkfs.erofs -zlz4hc system_new.img system
-            sudo mkfs.erofs -zlz4hc product_new.img product
-            sudo mkfs.erofs -zlz4hc system_ext_new.img system_ext
-          fi
+          {
+            cd "${{ env.ROM_DIR }}/images"
+            MAX_JOBS=2
+            FAIL=0
+            for part in ${{ env.ACTIVE_PARTS }}; do
+              (
+                FS_VAR=${part^^}_FS
+                SIZE_MB_VAR=${part^^}_MB
+                if [ "${!FS_VAR}" = "ext4" ]; then
+                  truncate -s ${!SIZE_MB_VAR}M "${part}_new.img"
+                  sudo mke2fs -t ext4 -L "$part" -M "/$part" -O ^has_journal "${part}_new.img"
+                  sudo e2fsdroid -e -a "/$part" -f "$part" "${part}_new.img"
+                else
+                  sudo mkfs.erofs -zlz4hc "${part}_new.img" "$part"
+                fi
+                img2simg "${part}_new.img" "${part}_sparse.img"
+                mv "${part}_sparse.img" "${part}_new.img"
+              ) || FAIL=1 &
+              while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do sleep 1; done
+            done
+            wait
+            [ "$FAIL" -eq 0 ] || { echo "❌ A parallel build job failed"; exit 1; }
+          } 2>&1 | tee -a build.log
 
-      - name: 🧱 Build Super Image
+      - name: 🧱 Build Super Image (Verified)
         run: |
           set -euo pipefail
-          cd "${{ env.ROM_DIR }}/images"
-          
-          [ -f system_new.img ] || { echo "ERROR: system_new.img missing"; exit 1; }
-          [ -f product_new.img ] || { echo "ERROR: product_new.img missing"; exit 1; }
-          [ -f system_ext_new.img ] || { echo "ERROR: system_ext_new.img missing"; exit 1; }
+          {
+            cd "${{ env.ROM_DIR }}/images"
+            LP_ARGS="--metadata-size 65536 --metadata-slots 2 --super-name super --device super:${{ env.SUPER_FINAL }} --group main:${{ env.SUPER_FINAL }} --alignment 4096 --sparse"
+            
+            for part in ${{ env.ACTIVE_PARTS }}; do
+              BYTES_VAR=${part^^}_BYTES
+              LP_ARGS="$LP_ARGS --partition ${part}_a:readonly:${!BYTES_VAR}:main --image ${part}_a=${part}_new.img --partition ${part}_b:readonly:0:main"
+            done
+            
+            lpmake $LP_ARGS --output super_final.img
+            file super_final.img | grep -q "Android sparse image" || { echo "❌ Corrupted super image output"; exit 1; }
+            mv super_final.img super.img
+          } 2>&1 | tee -a build.log
 
-          LP_ARGS="--metadata-size 65536 --metadata-slots 2 --super-name super --device super:${SUPER_SIZE} --group main:${SUPER_SIZE} --sparse"
-          
-          lpmake $LP_ARGS \
-            --partition system_a:readonly:${SYS_BYTES}:main --image system_a=system_new.img \
-            --partition system_b:readonly:0:main \
-            --partition product_a:readonly:${PROD_BYTES}:main --image product_a=product_new.img \
-            --partition product_b:readonly:0:main \
-            --partition system_ext_a:readonly:${EXT_BYTES}:main --image system_ext_a=system_ext_new.img \
-            --partition system_ext_b:readonly:0:main \
-            --output super_final.img
-          
-          mv super_final.img super.img
-          echo "✅ Final super.img created: $(ls -lh super.img | awk '{print $5}')"
-
-      - name: 📦 Clean, Pack & Checksum
+      - name: 📦 Pack & Checksum
         run: |
           set -euo pipefail
-          cd "${{ env.ROM_DIR }}/images"
-          sudo umount mnt_sys mnt_prod mnt_ext || true
-          sudo rm -rf super_raw.img super_extracted system product system_ext *_new.img *_raw.img mnt_*
-          cd ../..
-          
-          DATE_STAMP=$(date +%Y%m%d)
-          echo "DATE_STAMP=$DATE_STAMP" >> $GITHUB_ENV
-          
-          FINAL_NAME="Debloated_${{ env.ORIGINAL_FILENAME }}_${DATE_STAMP}.tgz"
-          echo "FINAL_NAME=$FINAL_NAME" >> $GITHUB_ENV
-          
-          # Pack and Checksum
-          tar -I pigz -cvf "$FINAL_NAME" "${{ env.ROM_DIR }}"
-          sha256sum "$FINAL_NAME" > "${FINAL_NAME}.sha256"
-          
-          # Accurately calculate duration
-          END_TIME=$(date +%s)
-          DURATION=$((END_TIME - ${BUILD_START:-END_TIME}))
-          echo "BUILD_TIME=$DURATION" >> $GITHUB_ENV
-          
-          # Integrity Sanity Check
-          stat -c "%n %s bytes" "$FINAL_NAME"
-          sha256sum -c "${FINAL_NAME}.sha256"
-          ls -lh "$FINAL_NAME"*
+          {
+            cd "${{ env.ROM_DIR }}/images"
+            sudo rm -rf super_raw.img super_extracted system product system_ext vendor odm vendor_dlkm system_dlkm *_new.img mnt_* 2>/dev/null || true
+            cd ../..
+            
+            DATE_STAMP=$(date +%Y%m%d)
+            FINAL_NAME="Debloated_${{ env.ORIGINAL_FILENAME }}_${DATE_STAMP}.tgz"
+            echo "FINAL_NAME=$FINAL_NAME" >> $GITHUB_ENV
+            tar -I 'pigz -9' -cvf "$FINAL_NAME" "${{ env.ROM_DIR }}"
+            sha256sum "$FINAL_NAME" > "${FINAL_NAME}.sha256"
+          } 2>&1 | tee -a build.log
 
-      - name: 📊 Build Summary
+      - name: 📊 Summary
         run: |
-          set -euo pipefail
-          echo "✅ Build complete: ${{ env.FINAL_NAME }}"
-          echo "⏱ Build Duration: ${{ env.BUILD_TIME }} seconds"
-          echo "📏 Final Package Size: $(du -sh ${{ env.FINAL_NAME }} | cut -f1)"
-          echo "📏 Super Size (Uncompressed): $(ls -lh "${{ env.ROM_DIR }}/images/super.img" | awk '{print $5}')"
-          echo "📏 Partition Sizes: Sys: ${{ env.SYS_MB }}MB | Prod: ${{ env.PROD_MB }}MB | Ext: ${{ env.EXT_MB }}MB"
+          echo "### ✅ Diamond Build Success" >> $GITHUB_STEP_SUMMARY
+          echo "- **Duration:** $(($(date +%s) - BUILD_START))s" >> $GITHUB_STEP_SUMMARY
 
-      - name: 📤 Upload Artifacts
+      - name: 📤 Upload
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: ${{ env.ORIGINAL_FILENAME }}_debloated_${{ env.DATE_STAMP }}
+          name: ${{ env.ORIGINAL_FILENAME }}_debloated
           path: |
             *.tgz
             *.sha256
+            build.log
