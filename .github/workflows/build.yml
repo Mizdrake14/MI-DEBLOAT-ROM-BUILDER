@@ -33,7 +33,6 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt update
-          # FIX: Removed libsparse-utils (redundant/missing on ubuntu-latest)
           sudo apt install -y wget tar gzip pigz unzip \
             android-sdk-libsparse-utils e2fsprogs lz4 python3 \
             erofs-utils aria2 file sed coreutils
@@ -42,8 +41,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p bin
-          wget https://github.com/Yule-Cai/oppo_dump/raw/master/lpunpack -O bin/lpunpack
-          wget https://github.com/Yule-Cai/oppo_dump/raw/master/lpmake -O bin/lpmake
+          # Pulling static binaries from a reliable tools repository
+          wget https://github.com/LonelyFool/lptools_static/raw/main/bin/lpunpack -O bin/lpunpack
+          wget https://github.com/LonelyFool/lptools_static/raw/main/bin/lpmake -O bin/lpmake
           chmod +x bin/*
           sudo mv bin/* /usr/local/bin/
           command -v lpunpack || exit 1
@@ -61,10 +61,8 @@ jobs:
       - name: 📦 Extract ROM
         run: |
           set -euo pipefail
-          # Try gzip engine first, fallback to auto-detect
           tar -xvzf rom_archive.tgz || tar -xvf rom_archive.tgz
           
-          # Universal deep-search for images folder
           ROM_DIR=$(find . -type d -name "images" | head -n1 | sed 's|/images||')
           if [ -z "$ROM_DIR" ]; then echo "ERROR: images folder not found!"; exit 1; fi
           echo "ROM_DIR=$ROM_DIR" >> $GITHUB_ENV
@@ -131,7 +129,6 @@ jobs:
           PROD=$(sudo du -sm product | cut -f1)
           EXT=$(sudo du -sm system_ext | cut -f1)
           
-          # 150MB Buffer for metadata/safety
           SYS=$((SYS + 150)); PROD=$((PROD + 150)); EXT=$((EXT + 150))
           
           SYS_BYTES=$((SYS * 1024 * 1024))
@@ -207,16 +204,13 @@ jobs:
           FINAL_NAME="Debloated_${{ env.ORIGINAL_FILENAME }}_${DATE_STAMP}.tgz"
           echo "FINAL_NAME=$FINAL_NAME" >> $GITHUB_ENV
           
-          # Pack and Checksum
           tar -I pigz -cvf "$FINAL_NAME" "$ROM_DIR"
           sha256sum "$FINAL_NAME" > "${FINAL_NAME}.sha256"
           
-          # Accurately calculate duration
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - ${BUILD_START:-END_TIME}))
           echo "BUILD_TIME=$DURATION" >> $GITHUB_ENV
           
-          # Integrity Sanity Check
           stat -c "%n %s bytes" "$FINAL_NAME"
           sha256sum -c "${FINAL_NAME}.sha256"
           ls -lh "$FINAL_NAME"*
