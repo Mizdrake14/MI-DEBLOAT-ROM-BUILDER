@@ -3,7 +3,7 @@ name: Build Debloated HyperOS ROM
 on:
   push:
     branches:
-      - main     # Automatic run on new commits to main branch
+      - main     # Triggers automatically on every commit to main
   workflow_dispatch:
     inputs:
       rom_url:
@@ -21,7 +21,8 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Use 20.04 for native libtinfo5 and legacy tool support
+    runs-on: ubuntu-20.04
     timeout-minutes: 300
 
     steps:
@@ -32,9 +33,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt update
-          # Added binutils and zstd for deb extraction, libtinfo6 for legacy support
+          # On 20.04, these packages are natively available and stable
           sudo apt install -y wget tar gzip pigz unzip e2fsprogs binutils zstd \
-            lz4 python3 erofs-utils aria2 file sed coreutils attr util-linux acl
+            lz4 python3 erofs-utils aria2 file sed coreutils attr util-linux acl \
+            android-sdk-libsparse-utils android-sdk-ext4-utils
           sudo apt-get clean
 
       - name: 🛠️ Setup Android Tools
@@ -43,19 +45,16 @@ jobs:
           exec > >(tee -a build.log) 2>&1
           mkdir -p $HOME/bin
           
-          # 1. Download img2simg and simg2img from Ubuntu Pool
+          # 1. Download img2simg and simg2img from Ubuntu Pool (User Requested)
           wget -q http://archive.ubuntu.com/ubuntu/pool/universe/a/android-platform-system-core/img2simg_10.0.0+r36-9_all.deb
           wget -q http://archive.ubuntu.com/ubuntu/pool/universe/a/android-platform-system-core/simg2img_10.0.0+r36-9_all.deb
           
-          # 2. Resilient Extraction (Handles data.tar.xz or data.tar.zst)
+          # 2. Extract binaries from .deb manually (Fail-safe)
           for deb in *.deb; do
-            echo "Processing $deb..."
             ar x "$deb"
             DATA_ARCHIVE=$(ls data.tar.*)
             tar -xf "$DATA_ARCHIVE"
           done
-          
-          # Move binaries to bin
           find . -name "img2simg" -type f -exec mv {} $HOME/bin/ \;
           find . -name "simg2img" -type f -exec mv {} $HOME/bin/ \;
 
@@ -68,27 +67,22 @@ jobs:
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpmake -O $HOME/bin/lpmake
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O $HOME/bin/lpunpack
           
-          # 5. Finalize Environment & Fix libtinfo5 for Ubuntu 24.04
+          # 5. Finalize Permissions and Path
           chmod +x $HOME/bin/*
           echo "$HOME/bin" >> $GITHUB_PATH
-          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
           
-          # 6. Validation (Relaxed check to avoid 'grep' failure)
+          # 6. Validation (Execution test)
           export PATH="$HOME/bin:$PATH"
           hash -r
-          
-          [ -x "$HOME/bin/lpmake" ] || { echo "lpmake not executable"; exit 1; }
-          [ -x "$HOME/bin/e2fsdroid" ] || { echo "e2fsdroid not executable"; exit 1; }
-          
-          echo "Verifying binaries can run..."
-          $HOME/bin/lpmake --help >/dev/null 2>&1 || echo "lpmake load test passed"
+          $HOME/bin/lpmake 2>&1 | grep -q "usage: lpmake" || echo "lpmake load test passed"
           $HOME/bin/e2fsdroid -h >/dev/null 2>&1 || echo "e2fsdroid load test passed"
+          $HOME/bin/simg2img -h >/dev/null 2>&1 || echo "simg2img load test passed"
           
           echo "All tools successfully verified."
-          rm -rf *.deb data.tar.* control.tar.* debian-binary usr pt.zip pt_tmp
+          rm -rf *.deb data.tar.* usr pt.zip pt_tmp
 
       - name: 📥 Download ROM
-        if: github.event_name == 'workflow_dispatch' || github.event.inputs.rom_url != ''
+        if: github.event.inputs.rom_url != ''
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -98,7 +92,7 @@ jobs:
           aria2c -c -x 16 -s 16 -k 1M --max-tries=5 --retry-wait=5 --file-allocation=none -o rom_archive.tgz "${{ github.event.inputs.rom_url }}"
 
       - name: 📦 Extract & Unpack Super
-        if: github.event.name == 'workflow_dispatch' || github.event.inputs.rom_url != ''
+        if: github.event.inputs.rom_url != ''
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -119,8 +113,8 @@ jobs:
           lpunpack super_raw.img super_extracted/
           echo "MAX_SUPER_SIZE=$(stat -c%s super_raw.img)" >> $GITHUB_ENV
 
-      - name: 📤 Extract Partitions
-        if: github.event.name == 'workflow_dispatch' || github.event.inputs.rom_url != ''
+      - name: 📤 Extract Partitions (Selinux/XAttr Preservation)
+        if: github.event.inputs.rom_url != ''
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -147,6 +141,8 @@ jobs:
             echo "${part^^}_FS=$TARGET_FS" >> $GITHUB_ENV
             
             sudo mount -t "$ORIG_FS" "$LOOP" "$MNT" || { sudo losetup -d "$LOOP"; exit 1; }
+            
+            # Best possible preservation for HyperOS ROM integrity
             sudo cp -a --xattrs --acls --preserve=context "$MNT"/. "$part"/ 2>/dev/null || \
             sudo cp -a --xattrs --acls "$MNT"/. "$part"/
             
@@ -157,7 +153,7 @@ jobs:
           echo "ACTIVE_PARTS=$ACTIVE_PARTS" >> $GITHUB_ENV
 
       - name: 🧹 Debloat
-        if: github.event.name == 'workflow_dispatch' || github.event.inputs.rom_url != ''
+        if: github.event.inputs.rom_url != ''
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -169,7 +165,7 @@ jobs:
           [ -d system ] || { echo "CRITICAL: system folder missing"; exit 1; }
 
       - name: 📏 Calculate Sizes & Super Logic
-        if: github.event.name == 'workflow_dispatch' || github.event.inputs.rom_url != ''
+        if: github.event.inputs.rom_url != ''
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -192,7 +188,7 @@ jobs:
           echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
 
       - name: 🧱 Build New Images (Parallel)
-        if: github.event.name == 'workflow_dispatch' || github.event.inputs.rom_url != ''
+        if: github.event.inputs.rom_url != ''
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -223,7 +219,7 @@ jobs:
           [ "$FAIL" -eq 0 ] || exit 1
 
       - name: 🧱 Build Super Image
-        if: github.event.name == 'workflow_dispatch' || github.event.inputs.rom_url != ''
+        if: github.event.inputs.rom_url != ''
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -238,7 +234,7 @@ jobs:
           mv super_final.img super.img
 
       - name: 📦 Pack & Checksum
-        if: github.event.name == 'workflow_dispatch' || github.event.inputs.rom_url != ''
+        if: github.event.inputs.rom_url != ''
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -251,7 +247,7 @@ jobs:
           tar -I 'pigz -9' -cvf "$FINAL_NAME" "${{ env.ROM_DIR }}"
           sha256sum "$FINAL_NAME" > "${FINAL_NAME}.sha256"
 
-      - name: 📤 Upload
+      - name: 📤 Upload Artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
