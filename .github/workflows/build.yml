@@ -31,6 +31,7 @@ jobs:
           exec > >(tee -a build.log) 2>&1
           sudo add-apt-repository -y universe
           sudo apt update
+          # android-sdk-libsparse-utils provides img2simg and simg2img on 22.04 and 24.04
           sudo apt install -y wget tar gzip pigz unzip \
             android-sdk-libsparse-utils e2fsprogs \
             lz4 python3 erofs-utils aria2 file sed coreutils attr util-linux acl
@@ -40,34 +41,34 @@ jobs:
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
-          mkdir -p bin
+          mkdir -p bin tools_raw
           
-          # 1. Download LPTools
+          # 1. Download Static LPTools (Stable)
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpmake -O bin/lpmake
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O bin/lpunpack
           
-          # 2. Download & Extract Platform Tools
+          # 2. Download Official Platform Tools (Always latest)
           wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O pt.zip
-          unzip -q pt.zip # This creates a 'platform-tools' directory
+          unzip -q pt.zip -d tools_raw
           
-          # 3. Move binaries specifically
-          mv platform-tools/e2fsdroid bin/
-          mv platform-tools/simg2img bin/
-          mv platform-tools/img2simg bin/
+          # 3. Find and move e2fsdroid (Handles any internal path changes)
+          find tools_raw -type f -name "e2fsdroid" -exec mv {} bin/ \;
           
-          # 4. Install to System Path
+          # 4. Install everything to /usr/local/bin
           chmod +x bin/*
           sudo cp bin/* /usr/local/bin/
           
           # 5. Cleanup
-          rm -rf pt.zip platform-tools bin
+          rm -rf pt.zip tools_raw bin
           
-          # 6. Validation with Path Reset
-          hash -r # Force shell to re-scan PATH
-          command -v lpmake >/dev/null || { echo "lpmake failed"; exit 1; }
-          command -v lpunpack >/dev/null || { echo "lpunpack failed"; exit 1; }
-          command -v e2fsdroid >/dev/null || { echo "e2fsdroid failed"; exit 1; }
-          echo "Tools setup successfully."
+          # 6. Final Validation
+          hash -r
+          command -v lpmake >/dev/null || exit 1
+          command -v lpunpack >/dev/null || exit 1
+          command -v e2fsdroid >/dev/null || exit 1
+          command -v img2simg >/dev/null || exit 1
+          command -v simg2img >/dev/null || exit 1
+          echo "All Android tools (including e2fsdroid, simg2img) setup successfully."
 
       - name: 📥 Download ROM (Resumable)
         run: |
@@ -130,6 +131,7 @@ jobs:
             
             sudo mount -t "$ORIG_FS" "$LOOP" "$MNT" || { sudo losetup -d "$LOOP"; exit 1; }
             
+            # Use best-effort context preservation
             sudo cp -a --xattrs --acls --preserve=context "$MNT"/. "$part"/ 2>/dev/null || \
             sudo cp -a --xattrs --acls "$MNT"/. "$part"/
             
@@ -137,7 +139,7 @@ jobs:
             sudo losetup -d "$LOOP"
             rmdir "$MNT"
             
-            [ "$(ls -A "$part")" ] || { echo "$part extraction failed"; exit 1; }
+            [ "$(ls -A "$part")" ] || { echo "$part extraction failed (empty content)"; exit 1; }
           done
           echo "ACTIVE_PARTS=$ACTIVE_PARTS" >> $GITHUB_ENV
 
@@ -174,12 +176,11 @@ jobs:
           MAX_SIZE="$MAX_SUPER_SIZE"
           
           if [ "$SUPER_FINAL" -gt "$MAX_SIZE" ]; then
-             echo "Capping super image size to $MAX_SIZE"
              SUPER_FINAL="$MAX_SIZE"
           fi
           echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
 
-      - name: 🧱 Build New Images (Parallel)
+      - name: 🧱 Build New Images (Parallel & Failure Checked)
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
