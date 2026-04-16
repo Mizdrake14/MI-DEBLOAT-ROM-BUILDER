@@ -114,6 +114,7 @@ jobs:
             sudo mount -t "$ORIG_FS" "$LOOP" "$MNT" || { sudo losetup -d "$LOOP"; exit 1; }
             
             # Best-effort SELinux context preservation + XAttrs + ACLs
+            # Note: sudo is required here as the runner user doesn't own the mount contents
             sudo cp -a --xattrs --acls --preserve=context "$MNT"/. "$part"/ 2>/dev/null || \
             sudo cp -a --xattrs --acls "$MNT"/. "$part"/
             
@@ -134,9 +135,7 @@ jobs:
             chmod +x ../../debloat.sh
             bash ../../debloat.sh
           fi
-          # Integrity checks
           [ -d system ] || { echo "CRITICAL: system folder missing"; exit 1; }
-          [ -d vendor ] || echo "Info: vendor not found (normal in some architectures)"
 
       - name: 📏 Calculate Sizes & Super Logic
         run: |
@@ -160,7 +159,7 @@ jobs:
           MAX_SIZE="$MAX_SUPER_SIZE"
           
           if [ "$SUPER_FINAL" -gt "$MAX_SIZE" ]; then
-             echo "Safety cap: Reducing super size to $MAX_SIZE"
+             echo "Safety cap: Reducing super size to original max ($MAX_SIZE)"
              SUPER_FINAL="$MAX_SIZE"
           fi
           echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
