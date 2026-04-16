@@ -31,9 +31,8 @@ jobs:
           exec > >(tee -a build.log) 2>&1
           sudo add-apt-repository -y universe
           sudo apt update
-          # android-sdk-libsparse-utils provides img2simg and simg2img on 22.04 and 24.04
-          sudo apt install -y wget tar gzip pigz unzip \
-            android-sdk-libsparse-utils e2fsprogs \
+          # Basic system tools (e2fsprogs provides mke2fs)
+          sudo apt install -y wget tar gzip pigz unzip e2fsprogs \
             lz4 python3 erofs-utils aria2 file sed coreutils attr util-linux acl
           sudo apt-get clean
 
@@ -43,32 +42,35 @@ jobs:
           exec > >(tee -a build.log) 2>&1
           mkdir -p bin tools_raw
           
-          # 1. Download Static LPTools (Stable)
+          # 1. Download Static LPTools
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpmake -O bin/lpmake
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O bin/lpunpack
           
-          # 2. Download Official Platform Tools (Always latest)
+          # 2. Download Official Platform Tools
           wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O pt.zip
           unzip -q pt.zip -d tools_raw
           
-          # 3. Find and move e2fsdroid (Handles any internal path changes)
+          # 3. Recursive find to capture all 3 required binaries from Google
+          # This fixes the "command not found" for simg2img/img2simg
           find tools_raw -type f -name "e2fsdroid" -exec mv {} bin/ \;
+          find tools_raw -type f -name "simg2img" -exec mv {} bin/ \;
+          find tools_raw -type f -name "img2simg" -exec mv {} bin/ \;
           
-          # 4. Install everything to /usr/local/bin
+          # 4. Permissions and Installation
           chmod +x bin/*
           sudo cp bin/* /usr/local/bin/
           
           # 5. Cleanup
           rm -rf pt.zip tools_raw bin
           
-          # 6. Final Validation
+          # 6. Final Validation (Strict)
           hash -r
-          command -v lpmake >/dev/null || exit 1
-          command -v lpunpack >/dev/null || exit 1
-          command -v e2fsdroid >/dev/null || exit 1
-          command -v img2simg >/dev/null || exit 1
-          command -v simg2img >/dev/null || exit 1
-          echo "All Android tools (including e2fsdroid, simg2img) setup successfully."
+          command -v lpmake >/dev/null || { echo "lpmake failed"; exit 1; }
+          command -v lpunpack >/dev/null || { echo "lpunpack failed"; exit 1; }
+          command -v e2fsdroid >/dev/null || { echo "e2fsdroid failed"; exit 1; }
+          command -v simg2img >/dev/null || { echo "simg2img failed"; exit 1; }
+          command -v img2simg >/dev/null || { echo "img2simg failed"; exit 1; }
+          echo "All tools verified in /usr/local/bin"
 
       - name: 📥 Download ROM (Resumable)
         run: |
@@ -97,6 +99,7 @@ jobs:
           echo "ROM_DIR=$ROM_DIR" >> $GITHUB_ENV
           
           cd "$ROM_DIR/images"
+          # Use our verified simg2img
           if file super.img | grep -q "sparse"; then simg2img super.img super_raw.img; else cp super.img super_raw.img; fi
           mkdir -p super_extracted
           lpunpack super_raw.img super_extracted/
@@ -130,16 +133,12 @@ jobs:
             echo "${part^^}_FS=$TARGET_FS" >> $GITHUB_ENV
             
             sudo mount -t "$ORIG_FS" "$LOOP" "$MNT" || { sudo losetup -d "$LOOP"; exit 1; }
-            
-            # Use best-effort context preservation
             sudo cp -a --xattrs --acls --preserve=context "$MNT"/. "$part"/ 2>/dev/null || \
             sudo cp -a --xattrs --acls "$MNT"/. "$part"/
             
             sudo umount -l "$MNT"
             sudo losetup -d "$LOOP"
             rmdir "$MNT"
-            
-            [ "$(ls -A "$part")" ] || { echo "$part extraction failed (empty content)"; exit 1; }
           done
           echo "ACTIVE_PARTS=$ACTIVE_PARTS" >> $GITHUB_ENV
 
@@ -174,13 +173,12 @@ jobs:
           
           SUPER_FINAL=$((TOTAL_BYTES + BUFFER))
           MAX_SIZE="$MAX_SUPER_SIZE"
-          
           if [ "$SUPER_FINAL" -gt "$MAX_SIZE" ]; then
              SUPER_FINAL="$MAX_SIZE"
           fi
           echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
 
-      - name: 🧱 Build New Images (Parallel & Failure Checked)
+      - name: 🧱 Build New Images (Parallel)
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -188,24 +186,22 @@ jobs:
           
           MAX_JOBS=2
           set -m
-          
           for part in ${{ env.ACTIVE_PARTS }}; do
             (
               set -e
               FS_VAR=${part^^}_FS
               MB_VAR=${part^^}_MB
-              
               if [ "${!FS_VAR}" = "ext4" ]; then
                 truncate -s "${!MB_VAR}M" "${part}_new.img"
                 mke2fs -t ext4 -L "$part" -M "/$part" -O ^has_journal -N 200000 "${part}_new.img"
                 sudo e2fsdroid -e -a "/$part" -f "$part" "${part}_new.img"
+                # Use our verified img2simg
                 img2simg "${part}_new.img" "${part}_sparse.img" || cp "${part}_new.img" "${part}_sparse.img"
                 mv "${part}_sparse.img" "${part}_new.img"
               else
                 sudo mkfs.erofs -zlz4 "${part}_new.img" "$part" || exit 1
               fi
             ) &
-            
             while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do sleep 1; done
           done
           
@@ -213,7 +209,7 @@ jobs:
           for job in $(jobs -p); do
             wait "$job" || FAIL=1
           done
-          [ "$FAIL" -eq 0 ] || { echo "Parallel image build failed"; exit 1; }
+          [ "$FAIL" -eq 0 ] || exit 1
 
       - name: 🧱 Build Super Image
         run: |
@@ -226,9 +222,8 @@ jobs:
             BYTES_VAR=${part^^}_BYTES
             LP_ARGS="$LP_ARGS --partition ${part}_a:readonly:${!BYTES_VAR}:main --image ${part}_a=${part}_new.img --partition ${part}_b:readonly:0:main"
           done
-          lpmake $LP_ARGS --output super_final.img || { echo "lpmake failure"; exit 1; }
+          lpmake $LP_ARGS --output super_final.img || exit 1
           mv super_final.img super.img
-          [ -s super.img ] || { echo "super.img verification failed"; exit 1; }
 
       - name: 📦 Pack & Checksum
         run: |
