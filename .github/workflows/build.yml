@@ -47,8 +47,8 @@ jobs:
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O bin/lpunpack
           
           # Platform Tools - Improved Extraction Logic
-          wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O pt.zip
-          unzip -q pt.zip
+          wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O platform-tools.zip
+          unzip -q platform-tools.zip
           
           # Search and move binaries to avoid "filename not matched" errors
           find platform-tools/ -name "e2fsdroid" -exec mv {} bin/ \;
