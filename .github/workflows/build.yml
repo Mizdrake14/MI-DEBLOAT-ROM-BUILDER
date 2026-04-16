@@ -29,7 +29,6 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt update
-          # zstd is required to extract modern .deb packages
           sudo apt install -y wget tar gzip pigz unzip e2fsprogs \
             lz4 python3 erofs-utils aria2 file sed coreutils attr util-linux acl zstd
           sudo apt-get clean
@@ -44,10 +43,9 @@ jobs:
           wget -q http://archive.ubuntu.com/ubuntu/pool/universe/a/android-platform-system-core/img2simg_10.0.0+r36-9_all.deb
           wget -q http://archive.ubuntu.com/ubuntu/pool/universe/a/android-platform-system-core/simg2img_10.0.0+r36-9_all.deb
           
-          # 2. Resilient Extraction (Handles data.tar.xz or data.tar.zst)
+          # 2. Resilient Extraction
           for deb in *.deb; do
             ar x "$deb"
-            # Extract data archive regardless of extension (.xz or .zst)
             DATA_ARCHIVE=$(ls data.tar.*)
             tar --extract --file="$DATA_ARCHIVE" ./usr/bin/ 2>/dev/null || tar --extract --file="$DATA_ARCHIVE"
           done
@@ -66,17 +64,15 @@ jobs:
           # 5. Finalize Environment & Fix libtinfo5 for Ubuntu 24.04
           chmod +x $HOME/bin/*
           echo "$HOME/bin" >> $GITHUB_PATH
-          
-          # Crucial symlink for e2fsdroid compatibility
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
-          
           rm -rf *.deb data.tar.* control.tar.* debian-binary usr pt.zip pt_tmp
           
-          # 6. Validation
+          # 6. Validation (Checking help outputs because --version is unsupported)
           export PATH="$HOME/bin:$PATH"
           hash -r
-          lpmake --version >/dev/null || { echo "lpmake failed"; exit 1; }
-          e2fsdroid -h >/dev/null || { echo "e2fsdroid failed"; exit 1; }
+          lpmake 2>&1 | grep -q "usage: lpmake" || { echo "lpmake failed"; exit 1; }
+          e2fsdroid -h >/dev/null 2>&1 || { echo "e2fsdroid failed"; exit 1; }
+          simg2img -h >/dev/null 2>&1 || { echo "simg2img failed"; exit 1; }
           echo "All tools successfully verified."
 
       - name: 📥 Download ROM
