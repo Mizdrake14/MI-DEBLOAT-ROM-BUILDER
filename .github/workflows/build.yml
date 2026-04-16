@@ -28,13 +28,10 @@ jobs:
       - name: 📥 Dependencies
         run: |
           set -euo pipefail
-          exec > >(tee -a build.log) 2>&1
-          sudo add-apt-repository -y universe
           sudo apt update
-          # Install standard tools. android-sdk-libsparse-utils provides img2simg/simg2img
+          # Install standard tools only. 
           sudo apt install -y wget tar gzip pigz unzip e2fsprogs \
-            android-sdk-libsparse-utils lz4 python3 erofs-utils aria2 \
-            file sed coreutils attr util-linux acl libtinfo5
+            lz4 python3 erofs-utils aria2 file sed coreutils attr util-linux acl
           sudo apt-get clean
 
       - name: 🛠️ Setup Android Tools
@@ -43,28 +40,45 @@ jobs:
           exec > >(tee -a build.log) 2>&1
           mkdir -p $HOME/bin
           
-          # 1. Download Static LPTools (Ravindu - verified active)
+          # 1. Download img2simg and simg2img from Ubuntu Pool (.deb)
+          wget -q http://archive.ubuntu.com/ubuntu/pool/universe/a/android-platform-system-core/img2simg_10.0.0+r36-9_all.deb
+          wget -q http://archive.ubuntu.com/ubuntu/pool/universe/a/android-platform-system-core/simg2img_10.0.0+r36-9_all.deb
+          
+          # 2. Extract binaries from .deb packages manually
+          for deb in *.deb; do
+            ar x "$deb"
+            tar -xf data.tar.xz ./usr/bin/ 2>/dev/null || tar -xf data.tar.xz
+          done
+          [ -f usr/bin/img2simg ] && mv usr/bin/img2simg $HOME/bin/
+          [ -f usr/bin/simg2img ] && mv usr/bin/simg2img $HOME/bin/
+
+          # 3. Download e2fsdroid from Google (Using a direct static-compatible link)
+          # We'll use the official Platform Tools but run it through a check
+          wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O pt.zip
+          unzip -q pt.zip -d pt_tmp
+          find pt_tmp -name "e2fsdroid" -exec mv {} $HOME/bin/ \;
+          
+          # 4. Download Static LPTools (Ravindu)
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpmake -O $HOME/bin/lpmake
           wget -q https://github.com/ravindu644/android-lptools-static-x86_64/raw/main/lpunpack -O $HOME/bin/lpunpack
           
-          # 2. Download e2fsdroid from official Google Platform-Tools (Direct Link)
-          wget -q https://dl.google.com/android/repository/platform-tools-latest-linux.zip -O pt.zip
-          unzip -q pt.zip -d pt_tmp
-          # Find and move e2fsdroid regardless of internal folder structure
-          find pt_tmp -name "e2fsdroid" -exec mv {} $HOME/bin/ \;
-          
-          # 3. Permissions and Path
+          # 5. Finalize Environment
           chmod +x $HOME/bin/*
           echo "$HOME/bin" >> $GITHUB_PATH
+          rm -rf *.deb data.tar.xz control.tar.xz debian-binary usr pt.zip pt_tmp
           
-          # 4. Final Validation
+          # 6. Validation
           export PATH="$HOME/bin:$PATH"
           hash -r
           lpmake --version >/dev/null || { echo "lpmake failed"; exit 1; }
-          e2fsdroid -h >/dev/null || { echo "e2fsdroid failed"; exit 1; }
-          rm -rf pt.zip pt_tmp
+          # Check e2fsdroid (if it still fails due to libtinfo5, we use a fallback symlink)
+          if ! e2fsdroid -h >/dev/null 2>&1; then
+            sudo ln -s /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+          fi
+          e2fsdroid -h >/dev/null || { echo "e2fsdroid still failing after symlink"; exit 1; }
+          echo "All tools successfully verified."
 
-      - name: 📥 Download ROM (Resumable)
+      - name: 📥 Download ROM
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -130,7 +144,7 @@ jobs:
           done
           echo "ACTIVE_PARTS=$ACTIVE_PARTS" >> $GITHUB_ENV
 
-      - name: 🧹 Debloat & Integrity Check
+      - name: 🧹 Debloat
         run: |
           set -euo pipefail
           exec > >(tee -a build.log) 2>&1
@@ -159,7 +173,6 @@ jobs:
           BUFFER=$((TOTAL_BYTES / 10))
           [ "$BUFFER" -lt 268435456 ] && BUFFER=268435456
           SUPER_FINAL=$((TOTAL_BYTES + BUFFER))
-          # Safety Cap: Use Shell Variable
           RAW_MAX="${{ env.MAX_SUPER_SIZE }}"
           if [ "$SUPER_FINAL" -gt "$RAW_MAX" ]; then SUPER_FINAL="$RAW_MAX"; fi
           echo "SUPER_FINAL=$SUPER_FINAL" >> $GITHUB_ENV
